@@ -1,7 +1,6 @@
 
 import torch
 from torch import nn
-from typing import Tuple
 
 
 class LSTMDiscriminator(nn.Module):

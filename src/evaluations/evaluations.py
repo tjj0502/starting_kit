@@ -1,19 +1,10 @@
 import torch
 import torch.nn as nn
-import wandb
-from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
 import copy
-from src.utils import loader_to_tensor, to_numpy, save_obj, combine_dls
-import matplotlib.pyplot as plt
-from os import path as pt
-import seaborn as sns
-from src.evaluations.loss import Sig_mmd, SigMMDLoss, SigW1Loss, CrossCorrelLoss, HistoLoss, CovLoss, ACFLoss
-from src.evaluations.loss import sig_mmd_permutation_test #TODO: move to another file
+from src.utils import loader_to_tensor, to_numpy
+from src.evaluations.test_metrics import CrossCorrelLoss, HistoLoss, CovLoss, ACFLoss
 import numpy as np
-import os
-import signatory
-from src.utils import set_seed
 
 def _train_classifier(model, train_loader, test_loader, config, epochs=100):
     """
@@ -64,8 +55,6 @@ def _train_classifier(model, train_loader, test_loader, config, epochs=100):
 
                 inputs = inputs.to(device)
                 labels = labels.to(device)
-                if config.dataset == 'MNIST':
-                    inputs = inputs.squeeze(1).permute(0, 2, 1)
                 optimizer.zero_grad()
                 train = phase == "train"
                 with torch.set_grad_enabled(train):
@@ -139,9 +128,6 @@ def _test_classifier(model, test_loader, config):
 
             inputs = inputs.to(device)
             labels = labels.to(device)
-            if config.dataset == 'MNIST':
-
-                inputs = inputs.squeeze(1).permute(0, 2, 1)
 
             outputs = model(inputs)
             loss = criterion(outputs, labels)
@@ -421,254 +407,59 @@ def compute_predictive_score(real_train_dl, real_test_dl, fake_train_dl, fake_te
     std_loss = np.std(np.array(test_loss_list))
     return mean_loss, std_loss
 
-
-# def FID_score()
-
-
-def train_predictive_FID_model(real_train_dl, real_test_dl, config,
-                               hidden_size=64, num_layers=3, epochs=100, batch_size=64):
-    # Modified from: https://github.com/bioinf-jku/TTUR/blob/master/fid.py
-
-    class predictor(nn.Module):
-        def __init__(self, input_size, hidden_size, num_layers, out_size):
-            super(predictor, self).__init__()
-            self.rnn = nn.LSTM(input_size=input_size, num_layers=num_layers,
-                               hidden_size=hidden_size, batch_first=True)
-            self.linear1 = nn.Linear(hidden_size, 256)
-            self.linear2 = nn.Linear(256, out_size)
-
-        def forward(self, x):
-            x = self.rnn(x)[0][:, -1]
-            x = self.linear1(x)
-            return self.linear2(x)
-
-    real_train_dl = DataLoader(
-        real_train_dl.dataset, batch_size=batch_size, shuffle=True)
-    real_test_dl = DataLoader(real_test_dl.dataset,
-                              batch_size=batch_size, shuffle=True)
-    model_dir = './numerical_results/{dataset}/evaluate_model/'.format(
-        dataset=config.dataset)
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir, exist_ok=True)
-    else:
-        pass
-
-    if os.path.exists(pt.join(model_dir, 'fid_predictive_model.pt')):
-        if config.dataset == 'Pendigt' or config.dataset == 'SpeechCommands' or config.dataset == 'MNIST':
-            model = predictor(
-                config.input_dim, hidden_size, num_layers, out_size=config.num_classes)
-            model.load_state_dict(torch.load(
-                pt.join(model_dir, 'fid_predictive_model.pt')), strict=True)
-        else:
-            model = predictor(
-                real_train_dl.dataset[0][0].shape[-1], hidden_size, num_layers, out_size=real_train_dl.dataset[0][1].shape[-1])
-            model.load_state_dict(torch.load(
-                pt.join(model_dir, 'fid_predictive_model.pt')), strict=True)
-    else:
-        if config.dataset == 'Pendigt' or config.dataset == 'SpeechCommands' or config.dataset == 'MNIST':
-
-            # train_sampler = pen_target_sampler(
-            #   torch.arange(config.num_classes), real_train_dl.dataset.tensors[1])
-            # test_sampler = pen_target_sampler(
-            #   torch.arange(config.num_classes), real_test_dl.dataset.tensors[1])
-            real_train_dl = DataLoader(
-                real_train_dl.dataset,
-                batch_size=batch_size,
-                shuffle=True,
-            )
-            real_test_dl = DataLoader(
-                real_test_dl.dataset,
-                batch_size=batch_size,
-                shuffle=False,
-            )
-            model = predictor(
-                config.input_dim, hidden_size, num_layers, out_size=config.num_classes)
-
-            test_acc, test_loss = _train_classifier(
-                model.to(config.device), real_train_dl, real_test_dl, config, epochs=epochs)
-            print('predictive FID test accuracy:', test_acc)
-            save_obj(model.state_dict(), pt.join(
-                model_dir, 'fid_predictive_model.pt'))
-            torch.save(model.state_dict(),
-                       pt.join(wandb.run.dir, 'fid_predictive_model.pt'))
-
-        else:
-            model = predictor(
-                real_train_dl.dataset[0][0].shape[-1], hidden_size, num_layers, out_size=real_train_dl.dataset[0][1].shape[-1])
-            test_loss = _train_regressor(
-                model.to(config.device), real_train_dl, real_test_dl, config, epochs=epochs)
-
-            save_obj(model.state_dict(), pt.join(
-                model_dir, 'fid_predictive_model.pt'))
-            torch.save(model.state_dict(),
-                       pt.join(wandb.run.dir, 'fid_predictive_model.pt'))
-            print('predictive FID test mse:', test_loss)
-    return model
-
-
-def sig_fid_model(X: torch.tensor, config):
+def full_evaluation(real_dl, fake_dl, config):
+    """ evaluation for the synthetic generation, including.
+        1) Stylized facts: marginal distribution, cross-correlation, autocorrelation, covariance scores.
+        2) Implicit scores: discriminative score, predictive score.
+    Args:
+        real_dl (_type_): torch.dataloader
+        fake_dl (_type_): torch..dataloader
     """
-    Parameters
-    ----------
-    X: torch.tensor, [N,T,C]
-    config: configuration file
-
-    Returns
-    -------
-    Trained model that minimized the L1 loss between the real and inferred signatures
-    """
-    Y = signatory.signature(X, 3)
-    N = X.shape[0]
-    real_train_dl = DataLoader(TensorDataset(
-        X[:int(N*0.8)], Y[:int(N*0.8)]), batch_size=128, shuffle=True)
-    real_test_dl = DataLoader(TensorDataset(X[int(N*0.8):], Y[int(N*0.8):]),
-                              batch_size=128, shuffle=False)
-
-    class predictor(nn.Module):
-        def __init__(self, input_size, hidden_size, num_layers, out_size):
-            super(predictor, self).__init__()
-            self.rnn = nn.LSTM(input_size=input_size, num_layers=num_layers,
-                               hidden_size=hidden_size, batch_first=True)
-            self.linear1 = nn.Linear(hidden_size, 512)
-            self.linear2 = nn.Linear(512, out_size)
-
-        def forward(self, x):
-            x = self.rnn(x)[0][:, -1]
-            x = self.linear1(x)
-            return self.linear2(x)
-    model = predictor(
-        real_train_dl.dataset[0][0].shape[-1], 64, 2, out_size=Y.shape[-1])
-    test_loss = _train_regressor(
-        model.to(config.device), real_train_dl, real_test_dl, config, epochs=200)
-    print('predictive FID test mse:', test_loss)
-
-    return model
-
-
-def full_evaluation(generator, real_train_dl, real_test_dl, config, **kwargs):
-    """
-    Evaluation for the synthetic generation, including:
-    1) Stylized facts: marginal distribution, cross-correlation, autocorrelation, covariance scores.
-    2) Implicit scores: discriminative score, predictive score, predictive_FID.
-    3) Rough path scores: SigW1 metric, Signature MMD.
-    We compute the mean and std of evaluation scores with 10000 samples and 10 repetitions
-    Parameters
-    ----------
-    real_train_dl: torch.utils.data DataLoader: dataset for training
-    real_test_dl: torch.utils.data DataLoader: dataset for testing
-    config: configuration file
-    kwargs
-    Returns
-    -------
-    Results will be logged in wandb
-
-    """
-    sns.set()
     d_scores = []
     p_scores = []
-    Sig_MMDs = []
     hist_losses = []
     cross_corrs = []
     cov_losses = []
     acf_losses = []
-    sigw1_losses = []
 
-    real_data = torch.cat([loader_to_tensor(real_train_dl),
-                          loader_to_tensor(real_test_dl)])
+    real_data = loader_to_tensor(real_dl).to(config.device).to(torch.float)
+    fake_data = loader_to_tensor(fake_dl).to(config.device).to(torch.float)
+
+    set_size = int(0.8 * real_data.shape[0])
+
+    real_data_train = real_data[:set_size,:,:]
+    real_data_test = real_data[set_size:,:,:]
+    fake_data_train = fake_data[:set_size,:,:]
+    fake_data_test = fake_data[set_size:,:,:]
+
+    real_train_dl = DataLoader(TensorDataset(real_data_train), batch_size=128)
+    real_test_dl = DataLoader(TensorDataset(real_data_test), batch_size=128)
+    fake_train_dl = DataLoader(TensorDataset(fake_data_train), batch_size=128)
+    fake_test_dl = DataLoader(TensorDataset(fake_data_test), batch_size=128)
+
     dim = real_data.shape[-1]
 
-    # TODO: improve (make full eval test_metrics dependent instead of main config)
-    if 'algo' in kwargs:
-        algo = kwargs['algo']
-    else:
-        algo = config.algo
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
 
-    cupy_seed = config.seed if 'seed' in config.keys() else None
+    d_score_mean, d_score_std = compute_discriminative_score(
+        real_train_dl, real_test_dl, fake_train_dl, fake_test_dl, config, int(dim / 2), 1, epochs=10, batch_size=128)
+    d_scores.append(d_score_mean)
+    p_score_mean, p_score_std = compute_predictive_score(
+        real_train_dl, real_test_dl, fake_train_dl, fake_test_dl, config, 32, 2, epochs=10, batch_size=128)
+    p_scores.append(p_score_mean)
 
-    before_update_metrics_config = 'sample_size' in config.keys()
-    sample_size = int(config.sample_size) if before_update_metrics_config else 10000
-    test_size = int(sample_size * config.test_ratio) if before_update_metrics_config else 2000
-    train_size = sample_size - test_size
-    batch_size = int(config.batch_size) if before_update_metrics_config else 256
+    cross_corrs.append(to_numpy(CrossCorrelLoss(
+        real_data, name='cross_correlation')(fake_data)))
+    hist_losses.append(
+        to_numpy(HistoLoss(real_data[:, 1:, :], n_bins=50, name='marginal_distribution')(fake_data[:, 1:, :])))
+    acf_losses.append(
+        to_numpy(ACFLoss(real_data, name='auto_correlation', stationary=False)(fake_data)))
+    cov_losses.append(to_numpy(CovLoss(real_data, name='covariance')(fake_data)))
 
-    n = 5
-    idx_all = torch.randint(real_data.shape[0], (sample_size*n,)) 
-
-    for i in tqdm(range(n)):
-        # take random 10000 samples from real dataset
-        # TODO: to update/merge test config later
-        idx = idx_all[i*sample_size:(i+1)*sample_size]
-        # idx = torch.randint(real_data.shape[0], (sample_size,))
-        real_train_dl = DataLoader(TensorDataset(
-            real_data[idx[:-test_size]]), batch_size=batch_size)
-        real_test_dl = DataLoader(TensorDataset(
-            real_data[idx[-test_size:]]), batch_size=batch_size)
-        if 'recovery' in kwargs:
-            recovery = kwargs['recovery']
-            fake_train_dl = fake_loader(generator, num_samples=train_size,
-                                        n_lags=config.n_lags, batch_size=batch_size, algo=algo, recovery=recovery)
-            fake_test_dl = fake_loader(generator, num_samples=test_size,
-                                       n_lags=config.n_lags, batch_size=batch_size, algo=algo, recovery=recovery
-                                       )
-        else:
-            fake_train_dl = fake_loader(generator, num_samples=train_size,
-                                        n_lags=config.n_lags, batch_size=batch_size, algo=algo)
-            fake_test_dl = fake_loader(generator, num_samples=test_size,
-                                       n_lags=config.n_lags, batch_size=batch_size, algo=algo
-                                       )
-
-        d_score_mean, d_score_std = compute_discriminative_score(
-            real_train_dl, real_test_dl, fake_train_dl, fake_test_dl, config, int(dim/2), 1, epochs=10, batch_size=128)
-        
-        d_scores.append(d_score_mean)
-        p_score_mean, p_score_std = compute_predictive_score(
-            real_train_dl, real_test_dl, fake_train_dl, fake_test_dl, config, 32, 2, epochs=10, batch_size=128)
-        p_scores.append(p_score_mean)
-        real = torch.cat([loader_to_tensor(real_train_dl),
-                          loader_to_tensor(real_test_dl)])
-        fake = torch.cat([loader_to_tensor(fake_train_dl),
-                          loader_to_tensor(fake_test_dl)])
-        # predictive_fid = FID_score(fid_model, real, fake)
-        # predictive_kid = KID_score(fid_model, real, fake)
-
-        sigw1_losses.append(
-            to_numpy(SigW1Loss(x_real=real, depth=2, name='sigw1')(fake)))
-        if False:
-            sig_mmd = Sig_mmd(real, fake, depth=5,seed=cupy_seed)
-            while sig_mmd > 1e3:
-                sig_mmd = Sig_mmd(real, fake, depth=5,seed=cupy_seed)
-        sig_mmd = to_numpy(SigMMDLoss(x_real=real, depth=5, seed=cupy_seed, name='sigmmd')(fake))
-        while sig_mmd > 1e3:
-            sig_mmd = to_numpy(SigMMDLoss(x_real=real, depth=5, seed=cupy_seed, name='sigmmd')(fake))
-
-        Sig_MMDs.append(sig_mmd)
-        cross_corrs.append(to_numpy(CrossCorrelLoss(
-            real, name='cross_correlation')(fake)))
-        if config.dataset == 'GBM' or config.dataset == 'ROUGH':
-            # Ignore the starting point
-            hist_losses.append(
-                to_numpy(HistoLoss(real[:, 1:, :], n_bins=50, name='marginal_distribution')(fake[:, 1:, :])))
-            # Compute the autocorrelation matrix
-            print('compute the autocorrelation matrix')
-            acf_losses.append(
-                to_numpy(ACFLoss(real, name='acf_loss', stationary=False)(fake)))
-        else:
-            hist_losses.append(
-                to_numpy(HistoLoss(real, n_bins=50, name='marginal_distribution')(fake)))
-            acf_losses.append(
-                to_numpy(ACFLoss(real, name='acf_loss')(fake)))
-
-        cov_losses.append(to_numpy(CovLoss(real, name='covariance')(fake)))
-        # FIDs.append(predictive_fid)
-        # KIDs.append(predictive_kid)
     d_mean, d_std = np.array(d_scores).mean(), np.array(d_scores).std()
     p_mean, p_std = np.array(p_scores).mean(), np.array(p_scores).std()
-    # fid_mean, fid_std = np.array(FIDs).mean(), np.array(FIDs).std()
-    # kid_mean, kid_std = np.array(KIDs).mean(), np.array(KIDs).std()
-    sigw1_mean, sigw1_std = np.array(
-        sigw1_losses).mean(), np.array(sigw1_losses).std()
-    sig_mmd_mean, sig_mmd_std = np.array(
-        Sig_MMDs).mean(), np.array(Sig_MMDs).std()
+
     hist_mean, hist_std = np.array(
         hist_losses).mean(), np.array(hist_losses).std()
     corr_mean, corr_std = np.array(
@@ -678,41 +469,13 @@ def full_evaluation(generator, real_train_dl, real_test_dl, config, **kwargs):
     acf_mean, acf_std = np.array(
         acf_losses).mean(), np.array(acf_losses).std()
 
-    # Permutation test
-    if 'recovery' in kwargs:
-        recovery = kwargs['recovery']
-        fake_data = loader_to_tensor(fake_loader(generator, num_samples=int(
-            real_data.shape[0]//2), n_lags=config.n_lags, batch_size=128, algo=algo, recovery=recovery))
-    else:
-        fake_data = loader_to_tensor(fake_loader(generator, num_samples=int(
-            real_data.shape[0]//2), n_lags=config.n_lags, batch_size=128, algo=algo))
-    power, type1_error = sig_mmd_permutation_test(real_data, fake_data, 5)
+    result_dict = {
+        "Predictive Score": p_mean,
+        "Discriminative Score": d_mean,
+        "Marginal Score": hist_mean,
+        "Correlation Score": corr_mean,
+        "Auto-correlation Score": acf_mean,
+        "Covariance Score": cov_mean
+    }
 
-    print('discriminative score with mean:', d_mean, 'std:', d_std)
-    print('predictive score with mean:', p_mean, 'std:', p_std)
-    print('marginal_distribution loss with mean:', hist_mean, 'std:', hist_std)
-    print('cross correlation loss with mean:', corr_mean, 'std:', corr_std)
-    print('covariance loss with mean:', cov_mean, 'std:', cov_std)
-    print('autocorrelation loss with mean:', acf_mean, 'std:', acf_std)
-    print('sigw1 with mean:', sigw1_mean, 'std:', sigw1_std)
-    print('sig mmd with mean:', sig_mmd_mean, 'std:', sig_mmd_std)
-    print('permutation test with power', power, 'type 1 error:', type1_error)
-
-    wandb.run.summary['discriminative_score_mean'] = d_mean
-    wandb.run.summary['discriminative_score_std'] = d_std
-    wandb.run.summary['predictive_score_mean'] = p_mean
-    wandb.run.summary['predictive_score_std'] = p_std
-    wandb.run.summary['sigw1_mean'] = sigw1_mean
-    wandb.run.summary['sigw1_std'] = sigw1_std
-    wandb.run.summary['sig_mmd_mean'] = sig_mmd_mean
-    wandb.run.summary['sig_mmd_std'] = sig_mmd_std
-    wandb.run.summary['cross_corr_loss_mean'] = corr_mean
-    wandb.run.summary['cross_corr_loss_std'] = corr_std
-    wandb.run.summary['marginal_distribution_loss_mean'] = hist_mean
-    wandb.run.summary['marginal_distribution_loss_std'] = hist_std
-    wandb.run.summary['cov_loss_mean'] = cov_mean
-    wandb.run.summary['cov_loss_std'] = cov_std
-    wandb.run.summary['acf_loss_mean'] = acf_mean
-    wandb.run.summary['acf_loss_std'] = acf_std
-    wandb.run.summary['permutation_test_power'] = power
-    wandb.run.summary['permutation_test_type1_error'] = type1_error
+    return result_dict

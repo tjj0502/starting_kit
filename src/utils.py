@@ -1,11 +1,8 @@
-
 from torch.nn.functional import one_hot
 import torch
 import torch.nn as nn
 import numpy as np
 import pickle
-from dataclasses import dataclass
-from typing import List, Tuple
 import os
 from ml_collections.config_dict import ConfigDict
 # import cupy
@@ -134,13 +131,9 @@ def init_weights(m):
 
 def get_experiment_dir(config):
     """Creates local directory for model saving and assessment"""
-    if config.model_type == 'VAE':
-        exp_dir = './numerical_results/{dataset}/algo_{gan}_Model_{model}_n_lag_{n_lags}_{seed}'.format(
-            dataset=config.dataset, gan=config.algo, model=config.model, n_lags=config.n_lags, seed=config.seed)
-    else:
-        exp_dir = './numerical_results/{dataset}/algo_{gan}_G_{generator}_D_{discriminator}_includeD_{include_D}_n_lag_{n_lags}_{seed}'.format(
-            dataset=config.dataset, gan=config.algo, generator=config.generator,
-            discriminator=config.discriminator, include_D=config.include_D, n_lags=config.n_lags, seed=config.seed)
+    exp_dir = './numerical_results/{dataset}/algo_{gan}_G_{generator}_D_{discriminator}_includeD_{include_D}_n_lag_{n_lags}_{seed}'.format(
+        dataset='rough', gan=config.algo, generator=config.generator,
+        discriminator=config.discriminator, include_D='False', n_lags=config.n_lags, seed=config.seed)
     os.makedirs(exp_dir, exist_ok=True)
     if config.train and os.path.exists(exp_dir):
         print("WARNING! The model exists in directory and will be overwritten")
